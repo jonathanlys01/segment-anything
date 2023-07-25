@@ -54,7 +54,7 @@ class AdaptedImageEncoderViT(nn.Module):
         super().__init__()
         self.img_size = img_size
 
-        assert len(ranks) == depth, "Number of ranks must match the depth of the network." # format: (-1,-1,...,4,4)
+        assert len(ranks) == depth, "Number of ranks must match the depth of the network." # format: (-1,-1,...,4,4), if -1, then use normal non biased attention
 
         self.patch_embed = PatchEmbed(
             kernel_size=(patch_size, patch_size),
@@ -70,6 +70,8 @@ class AdaptedImageEncoderViT(nn.Module):
                 torch.zeros(1, img_size // patch_size, img_size // patch_size, embed_dim)
             )
 
+
+        self.spatial_prior_module = SpatialPriorModule(mid = 64)
         self.blocks = nn.ModuleList()
         for i in range(depth):
             # Adapted block
@@ -108,11 +110,14 @@ class AdaptedImageEncoderViT(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.patch_embed(x)
+
+        spm = self.spatial_prior_module(x)
+
         if self.pos_embed is not None:
             x = x + self.pos_embed
 
         for blk in self.blocks:
-            x = blk(x)
+            x = blk(x, spm)
 
         x = self.neck(x.permute(0, 3, 1, 2))
 
@@ -122,6 +127,38 @@ class AdaptedImageEncoderViT(nn.Module):
 
 
 
+class SpatialPriorModule(nn.Module):
+    def __init__(self, mid):
+        super().__init__()
+        # input dim = 3 --> image
+        self.target = (64,64)
+        self.resnet = nn.Sequential(
+            nn.Conv2d(3, mid, kernel_size=3),
+            nn.BatchNorm2d(mid),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid, mid, kernel_size=3),
+            nn.BatchNorm2d(mid),
+        )
+        self.reduce_dim1 = nn.Conv2d(mid, mid, kernel_size=3, stride=2)
+        self.reduce_dim2 = nn.Conv2d(mid, mid, kernel_size=3, stride=2)
+        self.pooling = [nn.AdaptiveAvgPool2d(self.target),nn.AdaptiveAvgPool2d(self.target),nn.AdaptiveAvgPool2d(self.target)]
+        self.up = [nn.Conv2d(mid, 256, kernel_size=1),nn.Conv2d(mid, 256, kernel_size=1),nn.Conv2d(mid, 256, kernel_size=1)]
+
+    def forward(self, x):
+        x = self.resnet(x) # (B, mid, H, W)
+        x1 = self.reduce_dim1(x) # (B, mid, H/2, W/2)
+        x2 = self.reduce_dim2(x1) # (B, mid, H/4, W/4)
+        x0 = self.pooling[0](x ) # (B, mid, target[0], target[1])
+        x1 = self.pooling[1](x1) # (B, mid, target[0], target[1])
+        x2 = self.pooling[2](x2) # (B, mid, target[0], target[1])
+
+        x0 = self.up[0](x0) # (B, 256, target[0], target[1])
+        x1 = self.up[1](x1) # (B, 256, target[0], target[1])
+        x2 = self.up[2](x2) # (B, 256, target[0], target[1])
+
+        x = torch.cat([x0,x1,x2], dim=1) # (B, 256*3, target[0], target[1])
+
+        return x.permute(0, 2, 3, 1) # (B, target[0], target[1], 256*3) i.e. (B, 64, 64, 768)
         
 
 
@@ -185,7 +222,7 @@ class Block(nn.Module):
 
         self.window_size = window_size
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, spm:torch.Tensor) -> torch.Tensor:
         shortcut = x
         x = self.norm1(x)
         # Window partition
@@ -193,7 +230,7 @@ class Block(nn.Module):
             H, W = x.shape[1], x.shape[2]
             x, pad_hw = window_partition(x, self.window_size)
 
-        x = self.attn(x)
+        x = self.attn(x,spm)
         # Reverse window partition
         if self.window_size > 0:
             x = window_unpartition(x, self.window_size, pad_hw, (H, W))
@@ -237,11 +274,11 @@ class AdaptAttention(nn.Module):
 
 
 
-        self.q_lora = nn.Sequential([nn.Linear(dim, rank, bias=False), nn.Linear(rank, dim, bias=False)])
+        self.q_lora = nn.Sequential([nn.Linear(2*dim, rank, bias=False), nn.Linear(rank, dim, bias=False)])
 
-        self.k_lora = nn.Sequential([nn.Linear(dim, rank, bias=False), nn.Linear(rank, dim, bias=False)])
+        self.k_lora = nn.Sequential([nn.Linear(2*dim, rank, bias=False), nn.Linear(rank, dim, bias=False)])
 
-        self.v_lora = nn.Sequential([nn.Linear(dim, rank, bias=False), nn.Linear(rank, dim, bias=False)])
+        self.v_lora = nn.Sequential([nn.Linear(2*dim, rank, bias=False), nn.Linear(rank, dim, bias=False)])
 
         self.use_rel_pos = use_rel_pos
         if self.use_rel_pos:
@@ -252,13 +289,16 @@ class AdaptAttention(nn.Module):
             self.rel_pos_h = nn.Parameter(torch.zeros(2 * input_size[0] - 1, head_dim))
             self.rel_pos_w = nn.Parameter(torch.zeros(2 * input_size[1] - 1, head_dim))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, H, W, _ = x.shape
+    def forward(self, x: torch.Tensor, spm: torch.Tensor) -> torch.Tensor:
+        B, H, W, _ = x.shape # B,64,64,768
         # qkv with shape (3, B, nHead, H * W, C)
         qkv = self.qkv(x).reshape(B, H * W, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
 
         # q, k, v with shape (B * nHead, H * W, C)
         q, k, v = qkv.reshape(3, B * self.num_heads, H * W, -1).unbind(0)
+
+
+        x = torch.cat([x,spm], dim=-1) # B,64,64,768+768
 
         x_q = self.q_lora(x).reshape(B, H * W, self.num_heads, -1).permute(0, 2, 1, 3).reshape(B * self.num_heads, H * W, -1)
         x_k = self.k_lora(x).reshape(B, H * W, self.num_heads, -1).permute(0, 2, 1, 3).reshape(B * self.num_heads, H * W, -1)
@@ -318,7 +358,7 @@ class Attention(nn.Module):
             self.rel_pos_h = nn.Parameter(torch.zeros(2 * input_size[0] - 1, head_dim))
             self.rel_pos_w = nn.Parameter(torch.zeros(2 * input_size[1] - 1, head_dim))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor,spm: torch.Tensor) -> torch.Tensor: # spm not used
         B, H, W, _ = x.shape
         # qkv with shape (3, B, nHead, H * W, C)
         qkv = self.qkv(x).reshape(B, H * W, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)

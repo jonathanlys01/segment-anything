@@ -110,7 +110,18 @@ def _build_sam(
     if checkpoint is not None:
         with open(checkpoint, "rb") as f:
             state_dict = torch.load(f)
-        for i,rank in enumerate(ranks):
+        
+        # only load the weights that are in the state dict, the others will be initialized randomly
+        for name, param in sam.named_parameters():
+            if name in state_dict:
+                param.data = state_dict[name].data
+            else:
+                print(f"WARNING: {name} not found in checkpoint, initializing randomly")
+                torch.nn.init.kaiming_uniform_(param.data)
+
+
+    
+        """for i,rank in enumerate(ranks):
             if rank>0 and state_dict.get(f"image_encoder.blocks.{i}.attn.q_lora.0.weight") != None:
                 for block_ref in ['q_lora.0','k_lora.0','v_lora.0',]:
                     temp = torch.empty(rank,encoder_embed_dim)
@@ -123,5 +134,5 @@ def _build_sam(
                     state_dict[f"image_encoder.blocks.{i}.attn.{block_ref}.weight"] = temp
 
 
-        sam.load_state_dict(state_dict)
+        sam.load_state_dict(state_dict)"""
     return sam
